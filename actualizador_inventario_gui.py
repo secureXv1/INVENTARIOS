@@ -460,15 +460,14 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
     responsable_display = ""
 
     if cc_raw:
-            cc_digits = re.sub(r"\D", "", str(cc_raw))
-            if cc_digits:
-                # cc_map ya viene como "GRADO. NOMBRE"
-                responsable_display = cc_map.get(cc_digits, "")
+        cc_digits = re.sub(r"\D", "", str(cc_raw))
+        if cc_digits:
+            responsable_display = cc_map.get(cc_digits, "")
 
-        # Fallbacks: si no hubo match en Hoja CC
+    # Fallbacks: si no hubo match en Hoja CC
     if not responsable_display:
-            # último recurso legible
-            responsable_display = "SIN RESPONSABLE"
+        responsable_display = "SIN RESPONSABLE"
+
 
     log("Leyendo ítems del acta...\n")
     items_df = read_acta_items(acta_path, start_row=start_row)
@@ -586,6 +585,7 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
             'CANTIDAD',
             'OBSERVACIONES UNIDAD',
             'OBSERVACION INTERNA',
+            'UBICACIÓN', 
             'No ACTA',
             'FECHA',
             'RESPONSABLE'
@@ -625,6 +625,7 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
                 'CANTIDAD': cant,
                 'OBSERVACIONES UNIDAD': obs,  # <<<<<< observaciones del acta (incluye "N/A" literal)
                 'OBSERVACION INTERNA': f"Auto-registro ({'SIN SERIE' if kind=='NO_SERIE' else 'SERIE NO ENCONTRADA'})",
+                'UBICACIÓN': meta["location_code"],
                 'No ACTA': meta["acta_text"],
                 'FECHA': meta["date_str"],
                 'RESPONSABLE': responsable_display,
@@ -646,6 +647,69 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
             df.to_excel(writer, sheet_name=name, index=False)
 
     return out_path, meta, responsable_display, updated_hits, len(missing_serial_or_not_found)
+
+
+def validate_inventory(inv_path):
+    try:
+        xl = pd.ExcelFile(inv_path)
+    except Exception:
+        raise ValueError("FORMATO DE INVENTARIO NO ES CORRECTO")
+
+    # Debe existir hoja CC y SIN SERIAL
+    has_cc = any(re.search(r"\bcc\b", name, re.IGNORECASE) for name in xl.sheet_names)
+    sin_serial_name = next((n for n in xl.sheet_names if re.search(r"SIN\s*SERIAL", n, re.IGNORECASE)), None)
+
+    if not has_cc or not sin_serial_name:
+        raise ValueError("FORMATO DE INVENTARIO NO ES CORRECTO")
+
+    # Columnas mínimas en SIN SERIAL
+    df = xl.parse(sin_serial_name, dtype=str, keep_default_na=False)
+    cols = {re.sub(r"\s+", " ", str(c)).strip().upper(): c for c in df.columns}
+    required = [
+        "NO",
+        "DESCRIPCIÓN DEL ACTIVO Ó BIEN",
+        "DESCRIPCIÓN ADICIONAL - ACCESORIOS",
+        "NÚMERO DE SERIE DEL BIEN / O LOTE PARA EL CASO DE MUNICIÓN",
+        "NÚMERO INVENTARIO (CÓDIGO SAP/R6 SILOG)",
+        "VALOR DE ADQUISICIÓN",
+        "CANTIDAD",
+        "OBSERVACION INTERNA",   # existe
+        # "UBICACIÓN" la vamos a crear si falta
+        "NO ACTA",
+        "FECHA",
+        "RESPONSABLE",
+    ]
+    ok = all(any(re.sub(r"\s+", " ", c).strip().upper() == r for c in df.columns) for r in required)
+    if not ok:
+        # seguimos permitiendo porque podemos crear las que falten,
+        # pero si faltan muchas, lo consideramos inválido
+        missing = [r for r in required if r not in cols]
+        if len(missing) > 5:
+            raise ValueError("FORMATO DE INVENTARIO NO ES CORRECTO")
+
+
+def validate_acta(acta_path):
+    try:
+        wb = load_workbook(acta_path, data_only=True)
+    except Exception:
+        raise ValueError("FORMATO ACTA DE ASGINACION NO ES CORRECTO")
+
+    ws = wb.worksheets[0]
+
+    # Fecha en fila 8
+    if not parse_row8_date(ws):
+        raise ValueError("FORMATO ACTA DE ASGINACION NO ES CORRECTO")
+
+    # Responsable (al menos encontrar la cédula en tabla/entorno)
+    cc, _, _ = find_responsable(ws)
+    if not cc:
+        raise ValueError("FORMATO ACTA DE ASGINACION NO ES CORRECTO")
+
+    # Marcador de fin de listado
+    if not find_end_marker_row(acta_path):
+        raise ValueError("FORMATO ACTA DE ASGINACION NO ES CORRECTO")
+
+
 
 
 class App(tk.Tk):
@@ -791,41 +855,53 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo leer el ACTA.\n\n{e}")
 
-
     def run_process(self):
-        inv = self.inv_path.get().strip()
-        acta = self.acta_path.get().strip()
-        if not inv or not acta:
-            messagebox.showwarning("Faltan archivos", "Selecciona el Excel de INVENTARIO y el de ACTA.")
-            return
+            inv = self.inv_path.get().strip()
+            acta = self.acta_path.get().strip()
+            if not inv or not acta:
+                messagebox.showwarning("Faltan archivos", "Selecciona el Excel de INVENTARIO y el de ACTA.")
+                return
 
-        try:
+            # 1) Validaciones de formato (muestran alertas claras)
+            try:
+                validate_inventory(inv)
+                validate_acta(acta)
+            except ValueError as ve:
+                messagebox.showerror("Error de formato", str(ve))
+                return
+
+            # 2) Ejecutar proceso
             self.txt.delete("1.0", "end")
             self.log("Iniciando procesamiento...\n")
 
-            out_path, meta, resp, updated_count, added_count = process_inventory(
-                inv_path=inv,
-                acta_path=acta,
-                start_row=int(self.start_row.get()),
-                location_mode=self.location_mode.get(),
-                acta_mode=self.acta_mode.get(),
-                log=self.log
-            )
+            try:
+                out_path, meta, resp, updated_count, added_count = process_inventory(
+                    inv_path=inv,
+                    acta_path=acta,
+                    start_row=int(self.start_row.get()),
+                    location_mode=self.location_mode.get(),
+                    acta_mode=self.acta_mode.get(),
+                    log=self.log
+                )
 
-            self.log("\n=== RESUMEN ===\n")
-            self.log(f"Archivo generado: {out_path}\n")
-            self.log(f"Fecha acta: {meta.get('date_str')}\n")
-            self.log(f"No. ACTA: {meta.get('acta_text')}\n")
-            self.log(f"Ubicación: {meta.get('location_code')}\n")
-            self.log(f"Responsable (FUNCIONARIO QUE RECIBE): {resp}\n")
-            self.log(f"Actualizados por serie: {updated_count}\n")
-            self.log(f"Agregados a SIN SERIAL: {added_count}\n")
+                self.log("\n=== RESUMEN ===\n")
+                self.log(f"Archivo generado: {out_path}\n")
+                self.log(f"Fecha acta: {meta.get('date_str')}\n")
+                self.log(f"No. ACTA: {meta.get('acta_text')}\n")
+                self.log(f"Ubicación: {meta.get('location_code')}\n")
+                self.log(f"Responsable (FUNCIONARIO QUE RECIBE): {resp}\n")
+                self.log(f"Actualizados por serie: {updated_count}\n")
+                self.log(f"Agregados a SIN SERIAL: {added_count}\n")
 
-            if messagebox.askyesno("Listo", f"Archivo generado:\n{out_path}\n\n¿Abrir la carpeta contenedora?"):
-                os.startfile(os.path.dirname(out_path))
+                if messagebox.askyesno("Listo", f"Archivo generado:\n{out_path}\n\n¿Abrir la carpeta contenedora?"):
+                    os.startfile(os.path.dirname(out_path))
 
-        except Exception as e:
-            messagebox.showerror("Error", f"Ocurrió un error durante el proceso.\n\n{e}")
+            except ValueError as ve:
+                messagebox.showerror("Error de formato", str(ve))
+            except Exception as e:
+                messagebox.showerror("Error", f"Ocurrió un error durante el proceso.\n\n{e}")
+
+
 
 
 if __name__ == "__main__":
