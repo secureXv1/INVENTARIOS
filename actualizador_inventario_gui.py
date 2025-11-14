@@ -17,9 +17,9 @@ from openpyxl import load_workbook
 
 
 # -------- Config por defecto --------
-DEFAULT_START_ROW = 26     # Fila donde empiezan los encabezados en la tabla del acta
-DEFAULT_LOCATION_MODE = "raw"         # "raw" | "first_token"
-DEFAULT_ACTA_MODE = "prefix"          # "prefix" | "number_only"
+DEFAULT_START_ROW = 26                 # Fila donde empiezan los encabezados en la tabla del acta
+DEFAULT_LOCATION_MODE = "raw"          # "raw" | "first_token"
+DEFAULT_ACTA_MODE = "prefix"           # "prefix" | "number_only"
 
 
 # -------- Utilidades --------
@@ -31,9 +31,11 @@ ES_MONTHS = {
 ES_ABBR = {1:"ENE",2:"FEB",3:"MAR",4:"ABR",5:"MAY",6:"JUN",7:"JUL",8:"AGO",9:"SEP",10:"OCT",11:"NOV",12:"DIC"}
 
 def norm_str(x):
-    if pd.isna(x):
+    if x is None:
         return ""
-    return str(x).strip()
+    # Evita que 'N/A' sea procesado como NaN o se pierda
+    s = str(x)
+    return s.strip()
 
 def norm_serial(x):
     s = norm_str(x)
@@ -49,28 +51,150 @@ def format_stamp(dt: datetime) -> str:
     # "14NOV25 - 10_35"
     return f"{dt.day:02d}{ES_ABBR[dt.month]}{dt.year%100:02d} - {dt.hour:02d}_{dt.minute:02d}"
 
+# --- util: primer valor no vacío a la derecha, en la misma fila
+def first_right_value(ws, r, c_start, max_jump=6):
+    for c in range(c_start+1, c_start+1+max_jump):
+        v = ws.cell(r, c).value
+        if v is not None and str(v).strip():
+            return ws.cell(r, c).value
+    return None
+
+# --- Fecha del acta en fila 8 (cajas: DD / MM / AA o AÑO/ANIO)
 def parse_row8_date(ws):
     r = 8
-    values = [ws.cell(r, c).value for c in range(1, 25)]
-    tokens = [str(v).strip() for v in values if v is not None and str(v).strip()]
-    day = next((try_int(t) for t in tokens if try_int(t) and 1 <= try_int(t) <= 31), None)
-    mon = None
-    for t in tokens:
-        ti = try_int(t)
-        if ti and 1 <= ti <= 12:
-            mon = ti; break
-        up = re.sub(r"[^A-ZÁÉÍÓÚÑÜ]", "", t.upper())
-        if up in ES_MONTHS:
-            mon = ES_MONTHS[up]; break
-    year = None
-    for t in tokens:
-        ti = try_int(t)
-        if ti and (1900 <= ti <= 2100):
-            year = ti; break
-        if ti and (0 <= ti <= 99):
-            year = 2000 + ti; break
-    if day and mon and year:
-        return datetime(year, mon, day)
+    max_c = ws.max_column
+    day = mon = year = None
+
+    def cell_txt(rr, cc):
+        v = ws.cell(rr, cc).value
+        return str(v).strip().upper() if v is not None else ""
+
+    for c in range(1, max_c+1):
+        t = cell_txt(r, c)
+
+        # DD
+        if t in ("DD", "DIA", "DÍA"):
+            raw = first_right_value(ws, r, c)
+            try:
+                d = int(str(raw).strip())
+                if 1 <= d <= 31:
+                    day = d
+            except Exception:
+                pass
+
+        # MM
+        if t in ("MM", "MES"):
+            raw = first_right_value(ws, r, c)
+            try:
+                m = int(str(raw).strip())
+                if 1 <= m <= 12:
+                    mon = m
+            except Exception:
+                pass
+
+        # AA / AÑO / ANIO
+        if t in ("AA", "AÑO", "ANIO", "AÑO"):
+            raw = first_right_value(ws, r, c)
+            if raw is not None:
+                s = str(raw).strip()
+                if s.isdigit():
+                    y = int(s)
+                    if 0 <= y <= 99:
+                        year = 2000 + y
+                    elif 1900 <= y <= 2100:
+                        year = y
+
+    # Fallback: todos los números de la fila 8, en orden de aparición
+    if day is None or mon is None or year is None:
+        nums = []
+        for c in range(1, max_c+1):
+            v = ws.cell(r, c).value
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s.isdigit():
+                nums.append((int(s), c))
+        for i in range(len(nums)):
+            for j in range(i+1, len(nums)):
+                for k in range(j+1, len(nums)):
+                    d, _ = nums[i]
+                    m, _ = nums[j]
+                    y, _ = nums[k]
+                    if 1 <= d <= 31 and 1 <= m <= 12:
+                        if 0 <= y <= 99:
+                            y = 2000 + y
+                        if 1900 <= y <= 2100:
+                            day, mon, year = d, m, y
+                            break
+                if day and mon and year:
+                    break
+            if day and mon and year:
+                break
+
+    return datetime(year, mon, day) if (day and mon and year) else None
+
+# --- Responsable: lee en la fila del rótulo "FUNCIONARIO QUE RECIBE"
+def find_responsable(ws):
+    max_row, max_col = ws.max_row, ws.max_column
+    label_r = label_c = None
+    patt = re.compile(r"FUNCIONARIO\s+QUE\s+RECIBE", re.IGNORECASE)
+
+    # localizo el rótulo
+    for r in range(1, min(max_row, 200) + 1):
+        for c in range(1, min(max_col, 50) + 1):
+            v = ws.cell(r, c).value
+            if isinstance(v, str) and patt.search(v):
+                label_r, label_c = r, c
+                break
+        if label_r:
+            break
+
+    if not label_r:
+        return None, None  # no encontrado
+
+    def harvest_row(rr, c_from):
+        """Extrae nombre y CC escaneando a la derecha y también en la fila siguiente."""
+        texts = []
+        digits = []
+        for rr2 in (rr, rr+1):
+            if rr2 > max_row:
+                continue
+            for cc in range(c_from+1, min(c_from+12, max_col)+1):
+                val = ws.cell(rr2, cc).value
+                if val is None:
+                    continue
+                s = str(val).strip()
+                if not s:
+                    continue
+                texts.append(s)
+                s_digits = re.sub(r"\D", "", s)
+                if s_digits.isdigit() and 6 <= len(s_digits) <= 12:
+                    digits.append(s_digits)
+
+        # nombre “limpio”
+        joined = " ".join(texts)
+        joined = re.sub(r"(CC|C[ÉE]DULA|DOC(?:UMENTO)?|IDENTIDAD|N[°O]\.?)\s*[:\-]?", " ", joined, flags=re.IGNORECASE)
+        joined = re.sub(r"\d{6,}", " ", joined)
+        joined = re.sub(r"[^A-Za-zÁÉÍÓÚÑáéíóúüÜ\s\.\-]", " ", joined)
+        nombre = re.sub(r"\s+", " ", joined).strip() or None
+        cc = digits[0] if digits else None
+        return nombre, cc
+
+    nombre, cc = harvest_row(label_r, label_c)
+    return cc, nombre
+
+
+# --- Localiza la fila donde aparece el final del listado ("OBSERVACIONES Y RECOMENDACIONES")
+def find_end_marker_row(acta_path):
+    wb = load_workbook(acta_path, data_only=True)
+    ws = wb.worksheets[0]
+    max_row = ws.max_row
+    patt = re.compile(r"OBSERVACIONES\s+Y\s+RECOMENDACIONES", re.IGNORECASE)
+    for r in range(1, max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if isinstance(v, str) and patt.search(v):
+                return r
     return None
 
 
@@ -78,8 +202,10 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
     wb = load_workbook(path, data_only=True)
     ws = wb.worksheets[0]
 
+    # === Fecha exacta desde fila 8 (DD/MM/AA)
     found_date = parse_row8_date(ws)
 
+    # Construyo blob solo para otros metadatos (ACTA, ubicación)
     lines = []
     for r in range(1, 80):
         vals = []
@@ -91,18 +217,9 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
             lines.append(" | ".join(vals))
     blob = "\n".join(lines)
 
-    if not found_date:
-        m = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", blob)
-        if m:
-            raw = m.group(1)
-            for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y"):
-                try:
-                    found_date = datetime.strptime(raw, fmt)
-                    break
-                except Exception:
-                    pass
     date_str = found_date.strftime("%Y-%m-%d") if found_date else None
 
+    # ACTA No.
     acta_no = None
     m = re.search(r"ACTA\s*No\.?\s*([A-Za-z0-9\-_/]+)", blob, flags=re.IGNORECASE)
     if m:
@@ -114,6 +231,7 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
     else:
         acta_text = "ACTA"
 
+    # Ubicación DIPOL - GRISE - XXX
     loc_code = None
     m = re.search(r"DIPOL\s*-\s*GRISE\s*-\s*([A-Za-zÁÉÍÓÚÑÜ0-9\s]+)", blob, flags=re.IGNORECASE)
     if m:
@@ -131,34 +249,8 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
         if location_mode == "first_token":
             loc_code = loc_code.split()[0] if loc_code.split() else loc_code
 
-    fk_row = None
-    max_row = ws.max_row
-    for r in range(1, max_row + 1):
-        row_text = " ".join([str(ws.cell(r, c).value) for c in range(1, 15) if ws.cell(r, c).value is not None])
-        if re.search(r"FUNCIONARIO\s+QUE\s+RECIBE", row_text, re.IGNORECASE):
-            fk_row = r
-            break
-
-    recipient_cc, recipient_name = None, None
-    if fk_row:
-        block_text = []
-        for r in range(fk_row, min(fk_row + 3, max_row + 1)):
-            vals = [str(ws.cell(r, c).value) for c in range(1, 15) if ws.cell(r, c).value is not None]
-            if vals:
-                block_text.append(" ".join(vals))
-        joined = " | ".join(block_text)
-        tokens = re.split(r"\s+|[\|,;]", joined)
-        def is_cc_token(tok):
-            t = tok.replace(".", "").replace(",", "")
-            return t.isdigit() and 6 <= len(t) <= 12
-        cc_tokens = [t for t in tokens if is_cc_token(t)]
-        if cc_tokens:
-            recipient_cc = re.sub(r"\D", "", cc_tokens[0])
-        tmp = re.sub(r"FUNCIONARIO\s+QUE\s+RECIBE", "", joined, flags=re.IGNORECASE)
-        tmp = re.sub(r"CC|C[ÉE]DULA|DOC(?:UMENTO)?|IDENTIDAD", "", tmp, flags=re.IGNORECASE)
-        tmp = re.sub(r"\d{6,}", " ", tmp)
-        tmp = re.sub(r"[^A-Za-zÁÉÍÓÚÑáéíóúüÜ\s\.\-]", " ", tmp)
-        recipient_name = re.sub(r"\s+", " ", tmp).strip() or None
+    # === Responsable por cédula contigua a “FUNCIONARIO QUE RECIBE”
+    recipient_cc, recipient_name = find_responsable(ws)
 
     return {
         "date_str": date_str,
@@ -184,7 +276,8 @@ def build_cc_map_from_inventory(inv_xlsx):
     if not target_sheet:
         return {}
 
-    df = xl.parse(target_sheet, dtype=str)
+    # Mantener 'N/A' literal
+    df = xl.parse(target_sheet, dtype=str, keep_default_na=False)
     df.columns = [re.sub(r"\s+", " ", str(c)).strip().upper() for c in df.columns]
     col_grado = next((c for c in df.columns if "GRADO" in c), None)
     col_nombre = next((c for c in df.columns if "NOMBRES" in c or ("NOMBRE" in c and "APELL" in c)), None)
@@ -203,10 +296,20 @@ def build_cc_map_from_inventory(inv_xlsx):
     return cc_map
 
 
+# --- Lee la tabla de la ACTA y corta en el marcador de fin
 def read_acta_items(path, start_row=DEFAULT_START_ROW):
-    df = pd.read_excel(path, sheet_name=0, header=start_row - 1, dtype=str)
+    # Localiza la fila del marcador
+    end_marker_row = find_end_marker_row(path)
+    # nrows = cantidad de filas de datos por debajo del encabezado, hasta (antes de) el marcador
+    nrows = None
+    if end_marker_row and end_marker_row > start_row:
+        nrows = (end_marker_row - 1) - start_row  # antes del rótulo
+
+    # Mantener 'N/A' literal
+    df = pd.read_excel(path, sheet_name=0, header=start_row - 1, dtype=str, nrows=nrows, keep_default_na=False)
     df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
-    df = df.dropna(how="all")
+    # no dropna(how="all") para no perder filas con "N/A"; pero sí eliminar filas realmente vacías
+    df = df[~df.isna().all(axis=1)]
     return df
 
 
@@ -222,7 +325,9 @@ def find_col(df, patterns):
 def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, log):
     log("Cargando inventario...\n")
     inv_xl = pd.ExcelFile(inv_path)
-    inv_sheets = {name: inv_xl.parse(name, dtype=str) for name in inv_xl.sheet_names}
+
+    # Leer TODAS las hojas manteniendo 'N/A'
+    inv_sheets = {name: inv_xl.parse(name, dtype=str, keep_default_na=False) for name in inv_xl.sheet_names}
 
     log("Leyendo metadatos del acta...\n")
     meta = improved_find_acta_meta_xlsx(acta_path, location_mode, acta_mode)
@@ -246,16 +351,19 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
     log("Leyendo ítems del acta...\n")
     items_df = read_acta_items(acta_path, start_row=start_row)
 
+    # --- Columnas del acta, incluyendo OBSERVACIONES
     col_desc = find_col(items_df, [r"DESCRIPCI[ÓO]N DEL ACTIVO", r"DESCRIPCI[ÓO]N DEL ACTIVO [ÓO] BIEN", r"DESCRIPCI[ÓO]N DEL BIEN"])
     col_desc2 = find_col(items_df, [r"DESCRIPCI[ÓO]N ADICIONAL", r"ACCESORIOS"])
     col_serie = find_col(items_df, [r"N[ÚU]MERO DE SERIE", r"N[ÚU]MERO DE SERIE DEL BIEN", r"SERIE DEL BIEN"])
     col_inv   = find_col(items_df, [r"N[ÚU]MERO INVENTARIO", r"C[ÓO]DIGO SAP", r"R6 SILOG"])
     col_valor = find_col(items_df, [r"VALOR DE ADQUISICI[ÓO]N"])
     col_cant  = find_col(items_df, [r"CANTIDAD"])
+    col_obs   = find_col(items_df, [r"\bOBSERVACION(?:ES)?\b", r"\bOBSERVACIONES DEL ELEMENTO\b", r"\bOBSERVACIONES\b"])
 
-    items_work = items_df[[col_desc, col_desc2, col_serie, col_inv, col_valor, col_cant]].copy()
-    items_work.columns = ["DESC", "DESC2", "SERIE", "INV", "VALOR", "CANTIDAD"]
-    items_work = items_work.dropna(how="all")
+    # Conservar literales incluyendo "N/A"
+    use_cols = [col_desc, col_desc2, col_serie, col_inv, col_valor, col_cant, col_obs]
+    items_work = items_df[use_cols].copy()
+    items_work.columns = ["DESC", "DESC2", "SERIE", "INV", "VALOR", "CANTIDAD", "OBS"]
     items_work["SERIE_N"] = items_work["SERIE"].map(norm_serial)
 
     def std_cols(cols): return [re.sub(r"\s+", " ", str(c)).strip().upper() for c in cols]
@@ -267,27 +375,21 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
                 return i
         return None
 
+    # --- Esquemas por hoja: añadimos OBSERVACIONES UNIDAD
     def get_update_schema(sheet_name, cols_std):
         up = sheet_name.upper()
-        if "TECNOL" in up:
-            return {"SERIE": col_idx(cols_std, r"NUMERO DE SERIE"),
-                    "RESP":  col_idx(cols_std, r"\bRESPONSABLE\b"),
-                    "UBIC":  col_idx(cols_std, r"UBICACI[ÓO]N"),
-                    "ACTA":  col_idx(cols_std, r"NO\.? ACTA"),
-                    "FECHA": col_idx(cols_std, r"FECHA ULTIMA ASIGNACION")}
-        if "INMOB" in up:
-            return {"SERIE": col_idx(cols_std, r"NUMERO DE SERIE"),
-                    "RESP":  col_idx(cols_std, r"\bRESPONSABLE\b"),
-                    "UBIC":  col_idx(cols_std, r"UBICACI[ÓO]N"),
-                    "ACTA":  col_idx(cols_std, r"NO\.? ACTA"),
-                    "FECHA": col_idx(cols_std, r"FECHA ULTIMA ASIGNACION")}
+        schema_common = {
+            "SERIE": col_idx(cols_std, r"NUMERO DE SERIE"),
+            "RESP":  col_idx(cols_std, r"\bRESPONSABLE\b"),
+            "UBIC":  col_idx(cols_std, r"UBICACI[ÓO]N"),
+            "ACTA":  col_idx(cols_std, r"(NO\.?\s*ACTA|NUMERO DE ACTA)"),
+            "FECHA": col_idx(cols_std, r"FECHA ULTIMA ASIGNACION"),
+            "OBS_UNIT": col_idx(cols_std, r"OBSERVACIONES? UNIDAD")
+        }
         if "FUERA" in up:
-            return {"SERIE": col_idx(cols_std, r"NUMERO DE SERIE ELEMENTO"),
-                    "RESP":  col_idx(cols_std, r"\bRESPONSABLE\b"),
-                    "UBIC":  col_idx(cols_std, r"UBICACI[ÓO]N"),
-                    "ACTA":  col_idx(cols_std, r"NUMERO DE ACTA|NO\.? ACTA"),
-                    "FECHA": col_idx(cols_std, r"FECHA ULTIMA ASIGNACION")}
-        return None
+            schema_common["SERIE"] = schema_common["SERIE"] or col_idx(cols_std, r"NUMERO DE SERIE ELEMENTO")
+            schema_common["ACTA"]  = schema_common["ACTA"] or col_idx(cols_std, r"NUMERO DE ACTA|NO\.?\s*ACTA")
+        return schema_common
 
     schemas = {name: get_update_schema(name, sheet_cols_std[name]) for name in inv_sheets.keys()}
 
@@ -311,6 +413,7 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
     log("Aplicando actualizaciones...\n")
     for _, row in items_work.iterrows():
         serie_key = row["SERIE_N"]
+        obs_text  = norm_str(row["OBS"]) or None  # conservar "N/A" como texto
         if not serie_key:
             missing_serial_or_not_found.append(("NO_SERIE", row))
             continue
@@ -337,6 +440,9 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
                 if schema["FECHA"] is not None and meta["date_str"]:
                     col = df.columns[schema["FECHA"]]
                     df.at[idx, col] = meta["date_str"]
+                if schema["OBS_UNIT"] is not None and obs_text:
+                    col = df.columns[schema["OBS_UNIT"]]
+                    df.at[idx, col] = obs_text
             updated_hits += 1
             found_in_any = True
             break
@@ -344,6 +450,7 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
         if not found_in_any:
             missing_serial_or_not_found.append(("NOT_FOUND", row))
 
+    # --- Hoja SIN SERIAL: agregar y llevar observaciones a "OBSERVACIONES UNIDAD"
     sin_serial_name = next((n for n in inv_sheets.keys() if re.search(r"SIN\s*SERIAL", n, re.IGNORECASE)), None)
     if sin_serial_name:
         ss_df = inv_sheets[sin_serial_name]
@@ -379,12 +486,13 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
 
         append_rows = []
         for kind, r in missing_serial_or_not_found:
-            desc = norm_str(r["DESC"])
-            desc2 = norm_str(r["DESC2"])
-            serie = norm_str(r["SERIE"])
-            invn  = norm_str(r["INV"])
-            valor = norm_str(r["VALOR"])
+            desc = norm_str(r["DESC"])      # conserva "N/A"
+            desc2 = norm_str(r["DESC2"])    # conserva "N/A"
+            serie = norm_str(r["SERIE"])    # conserva "N/A"
+            invn  = norm_str(r["INV"])      # conserva "N/A"
+            valor = norm_str(r["VALOR"])    # conserva "N/A"
             cant  = norm_str(r["CANTIDAD"])
+            obs   = norm_str(r["OBS"]) or None
             append_rows.append({
                 'No': next_no,
                 'DESCRIPCIÓN DEL ACTIVO Ó BIEN': desc,
@@ -393,7 +501,7 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
                 'NÚMERO INVENTARIO (CÓDIGO SAP/R6 SILOG)': invn,
                 'VALOR DE ADQUISICIÓN': valor,
                 'CANTIDAD': cant,
-                'OBSERVACIONES UNIDAD': None,
+                'OBSERVACIONES UNIDAD': obs,  # <<<<<< observaciones del acta (incluye "N/A" literal)
                 'OBSERVACION INTERNA': f"Auto-registro ({'SIN SERIE' if kind=='NO_SERIE' else 'SERIE NO ENCONTRADA'})",
                 'No ACTA': meta["acta_text"],
                 'FECHA': meta["date_str"],
@@ -404,6 +512,7 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
         if append_rows:
             inv_sheets[sin_serial_name] = pd.concat([ss_df, pd.DataFrame(append_rows)], ignore_index=True)
 
+    # --- Guardar con el formato "14NOV25 - 10_35"
     stamp = format_stamp(datetime.now())
     base = os.path.splitext(os.path.basename(inv_path))[0]
     out_name = f"{base} {stamp}.xlsx"
