@@ -133,13 +133,71 @@ def parse_row8_date(ws):
 
     return datetime(year, mon, day) if (day and mon and year) else None
 
-# --- Responsable: lee en la fila del rótulo "FUNCIONARIO QUE RECIBE"
+
+# --- Responsable: detectar en tabla de ASISTENTES (CÉDULA / NOMBRES / CARGO)
+# --- Responsable: detectar en tabla de ASISTENTES (GRADO / CÉDULA / NOMBRES / CARGO)
 def find_responsable(ws):
     max_row, max_col = ws.max_row, ws.max_column
-    label_r = label_c = None
-    patt = re.compile(r"FUNCIONARIO\s+QUE\s+RECIBE", re.IGNORECASE)
 
-    # localizo el rótulo
+    def norm_cell(v):
+        return str(v).strip().upper() if v is not None else ""
+
+    # 1) Localizar fila de encabezados
+    header_row = None
+    col_idx = {"GRADO": None, "CEDULA": None, "NOMBRES": None, "CARGO": None}
+
+    for r in range(1, min(max_row, 400) + 1):
+        row_labels = [norm_cell(ws.cell(r, c).value) for c in range(1, min(max_col, 60) + 1)]
+        row_text = " | ".join(row_labels)
+
+        has_ced = ("CÉDULA" in row_text) or ("CEDULA" in row_text)
+        has_nom = ("NOMBRES" in row_text) or ("NOMBRES Y APELLIDOS" in row_text)
+        has_car = ("CARGO" in row_text)
+
+        if has_ced and has_nom and has_car:
+            header_row = r
+            for c, lab in enumerate(row_labels, start=1):
+                if re.search(r"\bGRADO\b", lab):
+                    col_idx["GRADO"] = c
+                if re.search(r"\bC[ÉE]DULA\b", lab):
+                    col_idx["CEDULA"] = c
+                if re.search(r"\bNOMBRES(\s+Y\s+APELLIDOS)?\b", lab):
+                    col_idx["NOMBRES"] = c
+                if re.search(r"\bCARGO\b", lab):
+                    col_idx["CARGO"] = c
+            break
+
+    # 2) Buscar fila con CARGO = "FUNCIONARIO QUE RECIBE"
+    if header_row and col_idx["CEDULA"] and col_idx["NOMBRES"] and col_idx["CARGO"]:
+        for r in range(header_row + 1, min(header_row + 120, max_row) + 1):
+            cargo = norm_cell(ws.cell(r, col_idx["CARGO"]).value)
+            if re.search(r"\bFUNCIONARIO\s+QUE\s+RECIBE\b", cargo, re.IGNORECASE):
+                # extraer CC, NOMBRE y (opcional) GRADO
+                cc_raw = ws.cell(r, col_idx["CEDULA"]).value
+                name_raw = ws.cell(r, col_idx["NOMBRES"]).value
+                grade_raw = ws.cell(r, col_idx["GRADO"]).value if col_idx["GRADO"] else None
+
+                cc = None
+                if cc_raw is not None:
+                    d = re.sub(r"\D", "", str(cc_raw))
+                    if d.isdigit() and 6 <= len(d) <= 12:
+                        cc = d
+
+                name = None
+                if name_raw is not None:
+                    s = str(name_raw).strip()
+                    name = re.sub(r"\s+", " ", s) or None
+
+                grade = None
+                if grade_raw is not None:
+                    g = str(grade_raw).strip()
+                    grade = re.sub(r"\s+", " ", g).upper() or None
+
+                return cc, name, grade
+
+    # 3) Respaldo: ventana alrededor del rótulo (sin grado garantizado)
+    patt = re.compile(r"FUNCIONARIO\s+QUE\s+RECIBE", re.IGNORECASE)
+    label_r = label_c = None
     for r in range(1, min(max_row, 200) + 1):
         for c in range(1, min(max_col, 50) + 1):
             v = ws.cell(r, c).value
@@ -150,38 +208,51 @@ def find_responsable(ws):
             break
 
     if not label_r:
-        return None, None  # no encontrado
+        return None, None, None
 
-    def harvest_row(rr, c_from):
-        """Extrae nombre y CC escaneando a la derecha y también en la fila siguiente."""
-        texts = []
-        digits = []
-        for rr2 in (rr, rr+1):
-            if rr2 > max_row:
-                continue
-            for cc in range(c_from+1, min(c_from+12, max_col)+1):
-                val = ws.cell(rr2, cc).value
-                if val is None:
-                    continue
-                s = str(val).strip()
+    def harvest_window(rr, cc_label, left_cols=12, right_cols=12, rows_up=1, rows_down=2):
+        r0 = max(1, rr - rows_up)
+        r1 = min(max_row, rr + rows_down)
+        cL = max(1, cc_label - left_cols)
+        cR = min(max_col, cc_label + right_cols)
+
+        left_texts, right_texts = [], []
+        left_digits, right_digits = [], []
+
+        for r in range(r0, r1 + 1):
+            for c in range(cL, cc_label):  # izquierda
+                s = norm_cell(ws.cell(r, c).value)
                 if not s:
                     continue
-                texts.append(s)
-                s_digits = re.sub(r"\D", "", s)
-                if s_digits.isdigit() and 6 <= len(s_digits) <= 12:
-                    digits.append(s_digits)
+                left_texts.append(s)
+                d = re.sub(r"\D", "", s)
+                if d.isdigit() and 6 <= len(d) <= 12:
+                    left_digits.append(d)
+            for c in range(cc_label + 1, cR + 1):  # derecha
+                s = norm_cell(ws.cell(r, c).value)
+                if not s:
+                    continue
+                right_texts.append(s)
+                d = re.sub(r"\D", "", s)
+                if d.isdigit() and 6 <= len(d) <= 12:
+                    right_digits.append(d)
 
-        # nombre “limpio”
-        joined = " ".join(texts)
+        return (left_texts, left_digits, right_texts, right_digits)
+
+    left_texts, left_digits, right_texts, right_digits = harvest_window(label_r, label_c)
+    cc = left_digits[0] if left_digits else (right_digits[0] if right_digits else None)
+
+    def clean_name(txts):
+        joined = " ".join(txts)
         joined = re.sub(r"(CC|C[ÉE]DULA|DOC(?:UMENTO)?|IDENTIDAD|N[°O]\.?)\s*[:\-]?", " ", joined, flags=re.IGNORECASE)
         joined = re.sub(r"\d{6,}", " ", joined)
         joined = re.sub(r"[^A-Za-zÁÉÍÓÚÑáéíóúüÜ\s\.\-]", " ", joined)
-        nombre = re.sub(r"\s+", " ", joined).strip() or None
-        cc = digits[0] if digits else None
-        return nombre, cc
+        return re.sub(r"\s+", " ", joined).strip() or None
 
-    nombre, cc = harvest_row(label_r, label_c)
-    return cc, nombre
+    nombre = clean_name(right_texts) or clean_name(left_texts)
+    grade = None  # en el respaldo no es fiable detectar grado
+    return cc, nombre, grade
+
 
 
 # --- Localiza la fila donde aparece el final del listado ("OBSERVACIONES Y RECOMENDACIONES")
@@ -243,14 +314,20 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
             if m2:
                 loc_code = m2.group(1).strip()
                 break
-    if loc_code:
-        loc_code = re.sub(r"[^A-Za-zÁÉÍÓÚÑÜ0-9\s\-]", " ", loc_code).strip()
-        loc_code = re.sub(r"\s+", " ", loc_code)
-        if location_mode == "first_token":
-            loc_code = loc_code.split()[0] if loc_code.split() else loc_code
+        if loc_code:
+        # sanitizado base
+            loc_code = re.sub(r"[^A-Za-zÁÉÍÓÚÑÜ0-9\s\-]", " ", loc_code).strip()
+            loc_code = re.sub(r"\s+", " ", loc_code)
+
+            # quitar cualquier rastro de 'OBJETIVO' y lo que siga
+            loc_code = re.sub(r"\bOBJETIVO\b.*$", "", loc_code, flags=re.IGNORECASE).strip()
+            loc_code = loc_code.rstrip("-—:| ").strip()
+
+            if location_mode == "first_token":
+                loc_code = loc_code.split()[0] if loc_code.split() else loc_code
 
     # === Responsable por cédula contigua a “FUNCIONARIO QUE RECIBE”
-    recipient_cc, recipient_name = find_responsable(ws)
+    recipient_cc, recipient_name, recipient_grade = find_responsable(ws)
 
     return {
         "date_str": date_str,
@@ -258,7 +335,9 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
         "location_code": loc_code,
         "recipient_cc": recipient_cc,
         "recipient_name": recipient_name,
+        "recipient_grade": recipient_grade,
     }
+
 
 
 def build_cc_map_from_inventory(inv_xlsx):
@@ -340,7 +419,13 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
     log("Construyendo mapa CC -> 'GRADO. NOMBRE APELLIDO'...\n")
     cc_map = build_cc_map_from_inventory(inv_path)
 
-    responsable_display = meta.get("recipient_name") or ""
+    # --- Responsable display: usa GRADO + NOMBRE si vienen del acta; si no, resuelve por CC en Hoja CC
+    nombre = (meta.get("recipient_name") or "").strip()
+    grado  = (meta.get("recipient_grade") or "").strip()
+
+    responsable_display = ""
+    if nombre or grado:
+        responsable_display = f"{grado}. {nombre}".strip().strip(". ")
     if not responsable_display:
         cc = meta.get("recipient_cc")
         if cc:
