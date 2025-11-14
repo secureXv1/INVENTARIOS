@@ -59,6 +59,33 @@ def first_right_value(ws, r, c_start, max_jump=6):
             return ws.cell(r, c).value
     return None
 
+
+def clean_location(raw: str, mode="raw") -> str:
+    if not raw:
+        return raw
+    # 1) corta en palabras que no pertenecen a la ubicación
+    STOP_AT = r"(OBJETIVO|ASIGNACI[ÓO]N|RESPONSABLES?|NOMBRES?|INFORMACI[ÓO]N\s+P[ÚU]BLICA|FIRMA|CARGO)"
+    raw = re.split(STOP_AT, raw, flags=re.IGNORECASE)[0]
+
+    # 2) limpia separadores y basura
+    dash = r"[-–—]"
+    raw = re.sub(rf"\bOBJETIVO\b.*$", "", raw, flags=re.IGNORECASE)  # redundante por seguridad
+    raw = re.sub(rf"(?:\s*{dash}\s*)+$", "", raw)                     # guiones al final
+    raw = re.sub(r"[|:;,]+$", "", raw)                                # otros separadores finales
+    raw = re.sub(r"[^A-Za-zÁÉÍÓÚÑÜ0-9\s\-]", " ", raw)                # caracteres raros
+    raw = re.sub(r"\s+", " ", raw).strip()
+
+    # 3) si sigue muy largo, quédate con las primeras 2–4 palabras útiles
+    tokens = raw.split()
+    if len(tokens) >= 5:
+        raw = " ".join(tokens[:4])   # ajusta 3/4 si prefieres más corto
+
+    if mode == "first_token":
+        raw = tokens[0] if tokens else raw
+
+    return raw
+
+
 # --- Fecha del acta en fila 8 (cajas: DD / MM / AA o AÑO/ANIO)
 def parse_row8_date(ws):
     r = 8
@@ -276,7 +303,7 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
     # === Fecha exacta desde fila 8 (DD/MM/AA)
     found_date = parse_row8_date(ws)
 
-    # Construyo blob solo para otros metadatos (ACTA, ubicación)
+    # Construyo blob para patrones (ACTA, ubicación)
     lines = []
     for r in range(1, 80):
         vals = []
@@ -290,7 +317,7 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
 
     date_str = found_date.strftime("%Y-%m-%d") if found_date else None
 
-    # ACTA No.
+    # === ACTA No.
     acta_no = None
     m = re.search(r"ACTA\s*No\.?\s*([A-Za-z0-9\-_/]+)", blob, flags=re.IGNORECASE)
     if m:
@@ -302,31 +329,38 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
     else:
         acta_text = "ACTA"
 
-    # Ubicación DIPOL - GRISE - XXX
+    # === Ubicación DIPOL - GRISE - XXX (cortar estrictamente en "OBJETIVO")
     loc_code = None
-    m = re.search(r"DIPOL\s*-\s*GRISE\s*-\s*([A-Za-zÁÉÍÓÚÑÜ0-9\s]+)", blob, flags=re.IGNORECASE)
+    dash = r"[-–—]"
+    loc_pat = rf"DIPOL\s*{dash}\s*GRISE\s*{dash}\s*([A-Za-zÁÉÍÓÚÑÜ0-9\s\-\:\|\.\,]+)"
+
+    m = re.search(loc_pat, blob, flags=re.IGNORECASE)
     if m:
         loc_code = m.group(1).strip()
     if not loc_code:
         for r in (14, 15):
             row_text = " ".join([str(ws.cell(r, c).value) for c in range(1, 15) if ws.cell(r, c).value is not None])
-            m2 = re.search(r"DIPOL\s*-\s*GRISE\s*-\s*([A-Za-zÁÉÍÓÚÑÜ0-9\s]+)", row_text, flags=re.IGNORECASE)
+            m2 = re.search(loc_pat, row_text, flags=re.IGNORECASE)
             if m2:
                 loc_code = m2.group(1).strip()
                 break
-        if loc_code:
-        # sanitizado base
-            loc_code = re.sub(r"[^A-Za-zÁÉÍÓÚÑÜ0-9\s\-]", " ", loc_code).strip()
-            loc_code = re.sub(r"\s+", " ", loc_code)
 
-            # quitar cualquier rastro de 'OBJETIVO' y lo que siga
-            loc_code = re.sub(r"\bOBJETIVO\b.*$", "", loc_code, flags=re.IGNORECASE).strip()
-            loc_code = loc_code.rstrip("-—:| ").strip()
+    if loc_code:
+        # 1) Dejar estrictamente lo anterior a "OBJETIVO"
+        loc_code = re.split(r"\bOBJETIVO\b", loc_code, flags=re.IGNORECASE)[0]
 
-            if location_mode == "first_token":
-                loc_code = loc_code.split()[0] if loc_code.split() else loc_code
+        # 2) Limpieza de separadores finales y espacios
+        loc_code = re.sub(r"[|:;,]+$", "", loc_code)
+        loc_code = re.sub(rf"(?:\s*{dash}\s*)+$", "", loc_code)  # guiones al final
+        loc_code = re.sub(r"[^A-Za-zÁÉÍÓÚÑÜ0-9\s\-]", " ", loc_code)
+        loc_code = re.sub(r"\s+", " ", loc_code).strip()
 
-    # === Responsable por cédula contigua a “FUNCIONARIO QUE RECIBE”
+        # 3) first_token si se solicita
+        if location_mode == "first_token":
+            parts = loc_code.split()
+            loc_code = parts[0] if parts else loc_code
+
+    # === Responsable (solo CC; el nombre final se resuelve con Hoja CC en process_inventory)
     recipient_cc, recipient_name, recipient_grade = find_responsable(ws)
 
     return {
@@ -337,6 +371,8 @@ def improved_find_acta_meta_xlsx(path, location_mode=DEFAULT_LOCATION_MODE, acta
         "recipient_name": recipient_name,
         "recipient_grade": recipient_grade,
     }
+
+
 
 
 
