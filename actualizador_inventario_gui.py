@@ -420,18 +420,19 @@ def process_inventory(inv_path, acta_path, start_row, location_mode, acta_mode, 
     cc_map = build_cc_map_from_inventory(inv_path)
 
     # --- Responsable display: usa GRADO + NOMBRE si vienen del acta; si no, resuelve por CC en Hoja CC
-    nombre = (meta.get("recipient_name") or "").strip()
-    grado  = (meta.get("recipient_grade") or "").strip()
-
+    cc_raw = meta.get("recipient_cc")
     responsable_display = ""
-    if nombre or grado:
-        responsable_display = f"{grado}. {nombre}".strip().strip(". ")
+
+    if cc_raw:
+            cc_digits = re.sub(r"\D", "", str(cc_raw))
+            if cc_digits:
+                # cc_map ya viene como "GRADO. NOMBRE"
+                responsable_display = cc_map.get(cc_digits, "")
+
+        # Fallbacks: si no hubo match en Hoja CC
     if not responsable_display:
-        cc = meta.get("recipient_cc")
-        if cc:
-            responsable_display = cc_map.get(re.sub(r"\D", "", cc), "") or f"CC {cc}"
-    if not responsable_display:
-        responsable_display = "SIN RESPONSABLE"
+            # último recurso legible
+            responsable_display = "SIN RESPONSABLE"
 
     log("Leyendo ítems del acta...\n")
     items_df = read_acta_items(acta_path, start_row=start_row)
@@ -726,15 +727,34 @@ class App(tk.Tk):
                 location_mode=self.location_mode.get(),
                 acta_mode=self.acta_mode.get()
             )
+
+            # Mostrar fecha/acta/ubicación tal cual
             self.meta_fecha.set(meta.get("date_str") or "-")
             self.meta_acta.set(meta.get("acta_text") or "-")
             self.meta_ubic.set(meta.get("location_code") or "-")
-            self.meta_cc.set(meta.get("recipient_cc") or "-")
-            self.meta_name.set(meta.get("recipient_name") or "-")
 
-            self.log("Metadatos del ACTA actualizados.\n")
+            # Resolver responsable exclusivamente por CC contra Hoja CC (si ya escogiste inventario)
+            cc_show = meta.get("recipient_cc") or "-"
+            self.meta_cc.set(cc_show)
+
+            resolved_name = "-"
+            inv = self.inv_path.get().strip()
+            if inv and meta.get("recipient_cc"):
+                try:
+                    cc_map = build_cc_map_from_inventory(inv)
+                    cc_digits = re.sub(r"\D", "", str(meta["recipient_cc"]))
+                    if cc_digits and cc_digits in cc_map:
+                        resolved_name = cc_map[cc_digits]  # "GRADO. NOMBRE"
+                except Exception:
+                    pass
+
+            # Muestra el nombre resuelto (si no hay inv seleccionado o no coincide, queda "-")
+            self.meta_name.set(resolved_name)
+
+            self.log("Metadatos del ACTA actualizados (responsable resuelto por CC en Hoja CC si es posible).\n")
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo leer el ACTA.\n\n{e}")
+
 
     def run_process(self):
         inv = self.inv_path.get().strip()
